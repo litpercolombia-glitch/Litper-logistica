@@ -1,30 +1,37 @@
 // Litper Guides — Tracking API via EnvioClick unified batch endpoint
-// All 4 Colombian carriers through a single backend (no IP-block issues from Vercel)
-//
 // Carrier detection by guide prefix:
 //   014.../0014.../114.../0114... → Interrapidísimo  (idCarrier: 46)
 //   363...                        → Coordinadora      (idCarrier: 14)
 //   615.../616...                 → TCC               (idCarrier: 44)
 //   034...                        → Envia             (idCarrier: 28)
-//
-// EnvioClick batch endpoint:
-//   POST https://landing.envioclickpro.com/carriers/tracking-batch
-//   Headers: authorization: ce156067-9edc-4cf2-80d1-5b5497d6e625
-//   Body: { idCarrier, trackingCodes: [...], showEvent: true, countryCode: "CO" }
-//   Response: { data: { events: { CODE: [{eventDateTime, eventDescription, eventPlace}] },
-//                        without_events: {} } }
 
-const ENVIOCLICK_TOKEN = 'ce156067-9edc-4cf2-80d1-5b5497d6e625';
+const ENVIOCLICK_TOKEN = process.env.ENVIOCLICK_TOKEN || 'ce156067-9edc-4cf2-80d1-5b5497d6e625';
 const ENVIOCLICK_URL   = 'https://landing.envioclickpro.com/carriers/tracking-batch';
 
 const CARRIER_CONFIG = {
-  interrapidisimo: { id: 46, name: 'Interrapidísimo' },
-  coordinadora:    { id: 14, name: 'Coordinadora'    },
-  tcc:             { id: 44, name: 'TCC'             },
-  envia:           { id: 28, name: 'Envía'           },
+  interrapidisimo: {
+    id: 46,
+    name: 'Interrapidísimo',
+    url: n => `https://www.interrapidisimo.com/seguimiento/?guia=${n}`,
+  },
+  coordinadora: {
+    id: 14,
+    name: 'Coordinadora',
+    url: n => `https://www.coordinadora.com/portafolio-de-servicios/servicios-en-linea/rastrear-guias/?guia=${n}`,
+  },
+  tcc: {
+    id: 44,
+    name: 'TCC',
+    url: n => `https://www.tcc.com.co/rastreo?numero=${n}`,
+  },
+  envia: {
+    id: 28,
+    name: 'Envía',
+    url: n => `https://www.envia.co/rastreo?numero=${n}`,
+  },
 };
 
-// ─── Carrier detection ───────────────────────────────────────────────────────
+// ─── Carrier detection ────────────────────────────────────────────────────────
 function detectCarrier(num) {
   const n = num.replace(/\s/g, '');
   if (/^(014|0014|114|0114)/.test(n)) return 'interrapidisimo';
@@ -42,7 +49,7 @@ async function queryEnvioClick(carrierKey, trackingCodes) {
     headers: {
       'authorization': ENVIOCLICK_TOKEN,
       'content-type':  'application/json',
-      'referer':        'https://www.envioclick.com/',
+      'referer':       'https://www.envioclick.com/',
     },
     body: JSON.stringify({
       idCarrier:     cfg.id,
@@ -52,17 +59,14 @@ async function queryEnvioClick(carrierKey, trackingCodes) {
     }),
     signal: AbortSignal.timeout(15000),
   });
-
-  if (!res.ok) {
-    throw new Error(`EnvioClick HTTP ${res.status} for ${cfg.name}`);
-  }
+  if (!res.ok) throw new Error(`EnvioClick HTTP ${res.status} for ${cfg.name}`);
   return res.json();
 }
 
 // ─── Status normalizer ────────────────────────────────────────────────────────
-// Maps Spanish event descriptions to semáforo status
+// Returns { litperStatus, semaforo, priority } — field names the frontend uses
 function normalizeStatus(description) {
-  if (!description) return { status: 'UNKNOWN', color: 'gray', priority: 50 };
+  if (!description) return { litperStatus: 'DESCONOCIDO', semaforo: 'gray', priority: 50 };
 
   const d = description.toLowerCase().trim();
 
@@ -73,10 +77,10 @@ function normalizeStatus(description) {
     d.includes('envío entregado') ||
     d === 'delivered'
   ) {
-    return { status: 'ENTREGADO', color: 'green', priority: 1 };
+    return { litperStatus: 'ENTREGADO', semaforo: 'green', priority: 1 };
   }
 
-  // EXCEPTION / NOVELTY — rojo
+  // EXCEPTION / NOVEDAD — rojo
   if (
     d.includes('no se entrega') ||
     d.includes('no entregad') ||
@@ -91,7 +95,7 @@ function normalizeStatus(description) {
     d.includes('ausente') ||
     d.includes('novedad')
   ) {
-    return { status: 'NOVEDAD', color: 'red', priority: 10 };
+    return { litperStatus: 'NOVEDAD', semaforo: 'red', priority: 10 };
   }
 
   // IN TRANSIT — amarillo
@@ -114,28 +118,45 @@ function normalizeStatus(description) {
     d.includes('admitid') ||
     d.includes('ingresad')
   ) {
-    return { status: 'EN RUTA', color: 'yellow', priority: 20 };
+    return { litperStatus: 'EN RUTA', semaforo: 'yellow', priority: 20 };
   }
 
-  // Fallback — in transit with unknown specific step
-  return { status: d.toUpperCase().substring(0, 40), color: 'yellow', priority: 25 };
+  // Fallback
+  return { litperStatus: d.toUpperCase().substring(0, 40), semaforo: 'yellow', priority: 25 };
+}
+
+// ─── Days since last event ────────────────────────────────────────────────────
+function computeDays(dateStr) {
+  if (!dateStr) return null;
+  try {
+    // EnvioClick sends "YYYY-MM-DD HH:MM:SS" or ISO
+    const d = new Date(dateStr.replace(' ', 'T'));
+    if (isNaN(d.getTime())) return null;
+    return Math.floor((Date.now() - d.getTime()) / 86400000);
+  } catch {
+    return null;
+  }
 }
 
 // ─── Build result object ──────────────────────────────────────────────────────
-function buildResult(number, carrierName, events, withoutEvents) {
-  // events: array sorted newest-first from EnvioClick, or null if in without_events
+// Field names match exactly what index.js expects
+function buildResult(number, phone, carrierKey, events, isWithout) {
+  const cfg = CARRIER_CONFIG[carrierKey];
+
   if (!events || events.length === 0) {
-    const isWithout = withoutEvents;
     return {
       number,
-      carrier:      carrierName,
-      status:       isWithout ? 'SIN EVENTOS' : 'ERROR',
-      color:        'gray',
+      phone:        phone || '',
+      carrier:      cfg.name,
+      carrierUrl:   cfg.url(number),
+      litperStatus: isWithout ? 'SIN EVENTOS' : 'ERROR',
+      semaforo:     'gray',
       priority:     90,
-      lastEvent:    null,
-      lastPlace:    '',
-      lastDate:     '',
-      eventHistory: [],
+      description:  isWithout ? 'Sin eventos registrados' : 'Error al consultar',
+      city:         '',
+      days:         null,
+      template:     null,
+      ticketText:   null,
     };
   }
 
@@ -144,18 +165,17 @@ function buildResult(number, carrierName, events, withoutEvents) {
 
   return {
     number,
-    carrier:      carrierName,
-    status:       norm.status,
-    color:        norm.color,
+    phone:        phone || '',
+    carrier:      cfg.name,
+    carrierUrl:   cfg.url(number),
+    litperStatus: norm.litperStatus,
+    semaforo:     norm.semaforo,
     priority:     norm.priority,
-    lastEvent:    latest.eventDescription,
-    lastPlace:    latest.eventPlace || '',
-    lastDate:     latest.eventDateTime || '',
-    eventHistory: events.map(e => ({
-      date:        e.eventDateTime,
-      description: e.eventDescription,
-      place:       e.eventPlace || '',
-    })),
+    description:  latest.eventDescription || '',
+    city:         latest.eventPlace || '',
+    days:         computeDays(latest.eventDateTime),
+    template:     null,
+    ticketText:   null,
   };
 }
 
@@ -170,11 +190,19 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Se requiere array de guías' });
   }
 
-  // Normalize and cap at 500
-  const normalized = guides
-    .slice(0, 500)
-    .map(g => String(g.number || g).trim())
-    .filter(n => n.length > 0);
+  // Preserve phone per guide number
+  const phoneMap = {};
+  const normalized = [];
+  for (const g of guides.slice(0, 500)) {
+    const num = String(g.number || g).trim();
+    if (!num) continue;
+    normalized.push(num);
+    if (g.phone) phoneMap[num] = g.phone;
+  }
+
+  if (normalized.length === 0) {
+    return res.status(400).json({ error: 'No se encontraron guías válidas' });
+  }
 
   // Group by carrier
   const groups = {
@@ -200,27 +228,30 @@ export default async function handler(req, res) {
 
   const settled = await Promise.all(promises);
 
-  // Build results array
   const results = [];
 
   for (const { key, data, error, skipped } of settled) {
-    const cfg        = CARRIER_CONFIG[key];
-    const guideNums  = groups[key];
+    const guideNums = groups[key];
     if (skipped || guideNums.length === 0) continue;
 
+    const cfg = CARRIER_CONFIG[key];
+
     if (error || !data) {
-      // Entire carrier failed
+      // Entire carrier query failed
       for (const num of guideNums) {
         results.push({
           number:       num,
+          phone:        phoneMap[num] || '',
           carrier:      cfg.name,
-          status:       'ERROR API',
-          color:        'gray',
+          carrierUrl:   cfg.url(num),
+          litperStatus: 'ERROR API',
+          semaforo:     'gray',
           priority:     95,
-          lastEvent:    error || 'Error consultando transportadora',
-          lastPlace:    '',
-          lastDate:     '',
-          eventHistory: [],
+          description:  error || 'Error consultando transportadora',
+          city:         '',
+          days:         null,
+          template:     null,
+          ticketText:   null,
         });
       }
       continue;
@@ -230,9 +261,9 @@ export default async function handler(req, res) {
     const withoutEvents = data?.data?.without_events || {};
 
     for (const num of guideNums) {
-      const evList    = events[num]        || null;
+      const evList    = events[num] || null;
       const isWithout = num in withoutEvents;
-      results.push(buildResult(num, cfg.name, evList, isWithout));
+      results.push(buildResult(num, phoneMap[num] || '', key, evList, isWithout));
     }
   }
 
@@ -240,18 +271,21 @@ export default async function handler(req, res) {
   for (const num of groups.unknown) {
     results.push({
       number:       num,
+      phone:        phoneMap[num] || '',
       carrier:      'Desconocida',
-      status:       'TRANSPORTADORA NO RECONOCIDA',
-      color:        'gray',
+      carrierUrl:   '#',
+      litperStatus: 'TRANSPORTADORA NO RECONOCIDA',
+      semaforo:     'gray',
       priority:     100,
-      lastEvent:    null,
-      lastPlace:    '',
-      lastDate:     '',
-      eventHistory: [],
+      description:  'Prefijo de guía no reconocido (usar 014/363/615/034)',
+      city:         '',
+      days:         null,
+      template:     null,
+      ticketText:   null,
     });
   }
 
-  // Sort: exceptions first, then in-transit, then delivered, then gray
+  // Sort: novedades first, en ruta, entregado, gray last
   results.sort((a, b) => a.priority - b.priority);
 
   return res.status(200).json({ guides: results });
