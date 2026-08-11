@@ -1,33 +1,33 @@
-// Litper Guides — Tracking API via EnvioClick unified batch endpoint
+// Litper Guides — Tracking API
 // Carrier detection by guide prefix:
-//   014.../0014.../114.../0114... → Interrapidísimo  (idCarrier: 46)
-//   363...                        → Coordinadora      (idCarrier: 14)
-//   615.../616...                 → TCC               (idCarrier: 44)
-//   034...                        → Envia             (idCarrier: 28)
+//   014.../0014.../114.../0114... → Interrapidísimo  (API propia)
+//   363...                        → Coordinadora      (EnvioClick idCarrier: 14)
+//   615.../616...                 → TCC               (EnvioClick idCarrier: 44)
+//   034...                        → Envia             (EnvioClick idCarrier: 28)
 
 const ENVIOCLICK_TOKEN = process.env.ENVIOCLICK_TOKEN || 'ce156067-9edc-4cf2-80d1-5b5497d6e625';
 const ENVIOCLICK_URL   = 'https://landing.envioclickpro.com/carriers/tracking-batch';
+const INTER_API_URL    = 'https://www.interrapidisimo.com/api/search_guia';
 
 const CARRIER_CONFIG = {
   interrapidisimo: {
-    id: 46,
     name: 'Interrapidísimo',
-    url: n => `https://www.interrapidisimo.com/seguimiento/?guia=${n}`,
+    url:  n => `https://www.interrapidisimo.com/`,
   },
   coordinadora: {
-    id: 14,
+    id:  14,
     name: 'Coordinadora',
-    url: n => `https://www.coordinadora.com/portafolio-de-servicios/servicios-en-linea/rastrear-guias/?guia=${n}`,
+    url:  n => `https://www.coordinadora.com/portafolio-de-servicios/servicios-en-linea/rastrear-guias/?guia=${n}`,
   },
   tcc: {
-    id: 44,
+    id:  44,
     name: 'TCC',
-    url: n => `https://www.tcc.com.co/rastreo?numero=${n}`,
+    url:  n => `https://www.tcc.com.co/rastreo?numero=${n}`,
   },
   envia: {
-    id: 28,
+    id:  28,
     name: 'Envía',
-    url: n => `https://www.envia.co/rastreo?numero=${n}`,
+    url:  n => `https://www.envia.co/rastreo?numero=${n}`,
   },
 };
 
@@ -39,6 +39,77 @@ function detectCarrier(num) {
   if (/^(615|616)/.test(n))           return 'tcc';
   if (/^034/.test(n))                 return 'envia';
   return 'unknown';
+}
+
+// ─── Interrapidísimo direct API ───────────────────────────────────────────────
+// POST https://www.interrapidisimo.com/api/search_guia
+// Body: { "NumerosGuias": "014XXX,014YYY" }
+async function queryInterrapidisimo(trackingCodes) {
+  const body = { NumerosGuias: trackingCodes.join(',') };
+  const res = await fetch(INTER_API_URL, {
+    method:  'POST',
+    headers: {
+      'content-type': 'application/json',
+      'accept':       'application/json',
+      'user-agent':   'Mozilla/5.0 (compatible; LitperBot/1.0)',
+      'origin':       'https://www.interrapidisimo.com',
+      'referer':      'https://www.interrapidisimo.com/',
+    },
+    body:   JSON.stringify(body),
+    signal: AbortSignal.timeout(20000),
+  });
+
+  // 404 or error body → guide not found (not a transport error)
+  if (res.status === 404) {
+    const j = await res.json().catch(() => ({}));
+    return { notFound: true, message: j.error || 'Guía no encontrada' };
+  }
+  if (!res.ok) {
+    throw new Error(`Interrapidísimo HTTP ${res.status}`);
+  }
+
+  const data = await res.json();
+  return { notFound: false, data };
+}
+
+// Parse Inter's success response into a normalized events array.
+// The exact format is unknown for confirmed deliveries; we handle defensively.
+// Known patterns from Next.js carrier APIs:
+//   - Array of objects with { estado, fecha, ciudad, descripcion }
+//   - Single object with a "guias" or "eventos" key
+function parseInterEvents(data, guideNum) {
+  if (!data) return null;
+
+  // If it's an array directly
+  if (Array.isArray(data)) {
+    return data.map(e => ({
+      eventDescription: e.estado || e.descripcion || e.description || e.eventDescription || String(e),
+      eventPlace:       e.ciudad  || e.city        || e.place       || '',
+      eventDateTime:    e.fecha   || e.date        || e.dateTime    || e.eventDateTime  || '',
+    }));
+  }
+
+  // If it's an object keyed by guide number
+  if (data[guideNum] && Array.isArray(data[guideNum])) {
+    return parseInterEvents(data[guideNum], guideNum);
+  }
+
+  // If it has a guias / eventos / events array
+  const arr = data.guias || data.eventos || data.events || data.tracking || data.resultado;
+  if (Array.isArray(arr)) {
+    return parseInterEvents(arr, guideNum);
+  }
+
+  // Single object — treat as a single event
+  if (typeof data === 'object' && Object.keys(data).length > 0) {
+    return [{
+      eventDescription: data.estado || data.descripcion || data.description || 'Guía localizada',
+      eventPlace:       data.ciudad  || data.city        || '',
+      eventDateTime:    data.fecha   || data.date        || '',
+    }];
+  }
+
+  return null;
 }
 
 // ─── EnvioClick batch query ───────────────────────────────────────────────────
@@ -59,12 +130,11 @@ async function queryEnvioClick(carrierKey, trackingCodes) {
     }),
     signal: AbortSignal.timeout(15000),
   });
-  if (!res.ok) throw new Error(`EnvioClick HTTP ${res.status} for ${cfg.name}`);
+  if (!res.ok) throw new Error(`EnvioClick HTTP ${res.status} para ${cfg.name}`);
   return res.json();
 }
 
 // ─── Status normalizer ────────────────────────────────────────────────────────
-// Returns { litperStatus, semaforo, priority } — field names the frontend uses
 function normalizeStatus(description) {
   if (!description) return { litperStatus: 'DESCONOCIDO', semaforo: 'gray', priority: 50 };
 
@@ -121,7 +191,6 @@ function normalizeStatus(description) {
     return { litperStatus: 'EN RUTA', semaforo: 'yellow', priority: 20 };
   }
 
-  // Fallback
   return { litperStatus: d.toUpperCase().substring(0, 40), semaforo: 'yellow', priority: 25 };
 }
 
@@ -129,7 +198,6 @@ function normalizeStatus(description) {
 function computeDays(dateStr) {
   if (!dateStr) return null;
   try {
-    // EnvioClick sends "YYYY-MM-DD HH:MM:SS" or ISO
     const d = new Date(dateStr.replace(' ', 'T'));
     if (isNaN(d.getTime())) return null;
     return Math.floor((Date.now() - d.getTime()) / 86400000);
@@ -139,7 +207,6 @@ function computeDays(dateStr) {
 }
 
 // ─── Build result object ──────────────────────────────────────────────────────
-// Field names match exactly what index.js expects
 function buildResult(number, phone, carrierKey, events, isWithout) {
   const cfg = CARRIER_CONFIG[carrierKey];
 
@@ -179,6 +246,114 @@ function buildResult(number, phone, carrierKey, events, isWithout) {
   };
 }
 
+// ─── Process Interrapidísimo guides ──────────────────────────────────────────
+async function processInter(guideNums, phoneMap) {
+  const results = [];
+  try {
+    const resp = await queryInterrapidisimo(guideNums);
+
+    if (resp.notFound) {
+      // API returned 404 for the entire batch (all guides unknown)
+      for (const num of guideNums) {
+        results.push({
+          number:       num,
+          phone:        phoneMap[num] || '',
+          carrier:      CARRIER_CONFIG.interrapidisimo.name,
+          carrierUrl:   CARRIER_CONFIG.interrapidisimo.url(num),
+          litperStatus: 'NO ENCONTRADA',
+          semaforo:     'gray',
+          priority:     80,
+          description:  resp.message,
+          city:         '',
+          days:         null,
+          template:     null,
+          ticketText:   null,
+        });
+      }
+      return results;
+    }
+
+    // Try to parse per-guide results from the response
+    for (const num of guideNums) {
+      // Inter may return a per-guide keyed object or a flat array
+      let eventsRaw = null;
+
+      if (resp.data) {
+        if (resp.data[num]) {
+          eventsRaw = parseInterEvents(resp.data[num], num);
+        } else if (Array.isArray(resp.data)) {
+          // Filter events for this guide (if data is a flat array)
+          const filtered = resp.data.filter(e =>
+            (e.guia || e.guide || e.numero || '') === num
+          );
+          eventsRaw = filtered.length > 0
+            ? parseInterEvents(filtered, num)
+            : parseInterEvents(resp.data, num); // use all if can't filter
+        } else {
+          eventsRaw = parseInterEvents(resp.data, num);
+        }
+      }
+
+      results.push(buildResult(num, phoneMap[num] || '', 'interrapidisimo', eventsRaw, false));
+    }
+  } catch (err) {
+    // Transport/network error — mark all guides as error
+    for (const num of guideNums) {
+      results.push({
+        number:       num,
+        phone:        phoneMap[num] || '',
+        carrier:      CARRIER_CONFIG.interrapidisimo.name,
+        carrierUrl:   CARRIER_CONFIG.interrapidisimo.url(num),
+        litperStatus: 'ERROR API',
+        semaforo:     'gray',
+        priority:     95,
+        description:  err.message || 'Error consultando Interrapidísimo',
+        city:         '',
+        days:         null,
+        template:     null,
+        ticketText:   null,
+      });
+    }
+  }
+  return results;
+}
+
+// ─── Process EnvioClick carriers ─────────────────────────────────────────────
+async function processEnvioClick(carrierKey, guideNums, phoneMap) {
+  const results = [];
+  const cfg = CARRIER_CONFIG[carrierKey];
+
+  try {
+    const data = await queryEnvioClick(carrierKey, guideNums);
+    const events        = data?.data?.events        || {};
+    const withoutEvents = data?.data?.without_events || {};
+
+    for (const num of guideNums) {
+      const evList    = events[num] || null;
+      const isWithout = num in withoutEvents;
+      results.push(buildResult(num, phoneMap[num] || '', carrierKey, evList, isWithout));
+    }
+  } catch (err) {
+    for (const num of guideNums) {
+      results.push({
+        number:       num,
+        phone:        phoneMap[num] || '',
+        carrier:      cfg.name,
+        carrierUrl:   cfg.url(num),
+        litperStatus: 'ERROR API',
+        semaforo:     'gray',
+        priority:     95,
+        description:  err.message || `Error consultando ${cfg.name}`,
+        city:         '',
+        days:         null,
+        template:     null,
+        ticketText:   null,
+      });
+    }
+  }
+  return results;
+}
+
 // ─── Main handler ─────────────────────────────────────────────────────────────
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -191,7 +366,7 @@ export default async function handler(req, res) {
   }
 
   // Preserve phone per guide number
-  const phoneMap = {};
+  const phoneMap  = {};
   const normalized = [];
   for (const g of guides.slice(0, 500)) {
     const num = String(g.number || g).trim();
@@ -216,58 +391,22 @@ export default async function handler(req, res) {
     groups[detectCarrier(num)].push(num);
   }
 
-  // Query each carrier concurrently (skip empties)
-  const carrierKeys = ['interrapidisimo', 'coordinadora', 'tcc', 'envia'];
-  const promises = carrierKeys.map(key =>
-    groups[key].length > 0
-      ? queryEnvioClick(key, groups[key])
-          .then(data => ({ key, data, error: null }))
-          .catch(err  => ({ key, data: null, error: err.message }))
-      : Promise.resolve({ key, data: null, error: null, skipped: true })
-  );
+  // Query all carriers concurrently
+  const promises = [];
 
-  const settled = await Promise.all(promises);
-
-  const results = [];
-
-  for (const { key, data, error, skipped } of settled) {
-    const guideNums = groups[key];
-    if (skipped || guideNums.length === 0) continue;
-
-    const cfg = CARRIER_CONFIG[key];
-
-    if (error || !data) {
-      // Entire carrier query failed
-      for (const num of guideNums) {
-        results.push({
-          number:       num,
-          phone:        phoneMap[num] || '',
-          carrier:      cfg.name,
-          carrierUrl:   cfg.url(num),
-          litperStatus: 'ERROR API',
-          semaforo:     'gray',
-          priority:     95,
-          description:  error || 'Error consultando transportadora',
-          city:         '',
-          days:         null,
-          template:     null,
-          ticketText:   null,
-        });
-      }
-      continue;
-    }
-
-    const events        = data?.data?.events        || {};
-    const withoutEvents = data?.data?.without_events || {};
-
-    for (const num of guideNums) {
-      const evList    = events[num] || null;
-      const isWithout = num in withoutEvents;
-      results.push(buildResult(num, phoneMap[num] || '', key, evList, isWithout));
+  if (groups.interrapidisimo.length > 0) {
+    promises.push(processInter(groups.interrapidisimo, phoneMap));
+  }
+  for (const key of ['coordinadora', 'tcc', 'envia']) {
+    if (groups[key].length > 0) {
+      promises.push(processEnvioClick(key, groups[key], phoneMap));
     }
   }
 
-  // Unknown carrier guides
+  const settled = await Promise.all(promises);
+  const results = settled.flat();
+
+  // Unknown carrier
   for (const num of groups.unknown) {
     results.push({
       number:       num,
