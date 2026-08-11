@@ -1,15 +1,14 @@
-const MAX_PER_BATCH = 40;
-const MAX_TOTAL = 200;
+// pages/api/track.js
+// Direct carrier APIs — no 17track dependency
+// Guide prefix routing:
+//   014.../114... → Interrapidísimo  (batches ≤5, must be 12 digits)
+//   363...        → Coordinadora     (bulk, up to 1000)
+//   615/616...    → TCC              (one at a time)
+//   034...        → Envia            (batch)
 
 export default async function handler(req, res) {
-  if (req.method !== 'POST') return res.status(405).json({ error: 'Method not allowed' });
-
-  const TOKEN = process.env.SEVENTEEN_TRACK_TOKEN;
-  if (!TOKEN) {
-    return res.status(200).json({
-      guides: [],
-      configError: 'Agrega SEVENTEEN_TRACK_TOKEN en Vercel → Settings → Environment Variables → tu token de 17track.net'
-    });
+  if (req.method !== 'POST') {
+    return res.status(405).json({ error: 'Method not allowed' });
   }
 
   const { guides } = req.body;
@@ -17,126 +16,394 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Se requiere array de guías' });
   }
 
-  const allGuides = guides.slice(0, MAX_TOTAL);
+  const MAX_TOTAL = 500;
+  const normalized = guides.slice(0, MAX_TOTAL).map(g => ({
+    number: String(g.number || g).trim(),
+    phone: String(g.phone || '').trim(),
+  }));
 
-  // Split into batches of 40
-  const batches = [];
-  for (let i = 0; i < allGuides.length; i += MAX_PER_BATCH) {
-    batches.push(allGuides.slice(i, i + MAX_PER_BATCH));
+  // Group by carrier key
+  const groups = { interrapidisimo: [], coordinadora: [], tcc: [], envia: [], unknown: [] };
+  for (const g of normalized) {
+    groups[detectCarrierKey(g.number)].push(g);
   }
 
-  // Run all batches in parallel
-  let batchResults;
-  try {
-    batchResults = await Promise.all(batches.map(async (batchItems) => {
-      const trackList = batchItems.map(g => ({ number: String(g.number).trim(), auto_detection: true }));
-      // Register (idempotent)
-      try {
-        await fetch('https://api.17track.net/track/v2.2/register', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json', '17token': TOKEN },
-          body: JSON.stringify(trackList)
-        });
-      } catch (_) {}
-      // Get tracking info
-      const r = await fetch('https://api.17track.net/track/v2.2/gettrackinfo', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', '17token': TOKEN },
-        body: JSON.stringify(trackList)
-      });
-      return await r.json();
-    }));
-  } catch (e) {
-    return res.status(500).json({ error: 'Error consultando 17track: ' + e.message });
-  }
+  // Query all carriers concurrently
+  const [interRes, coordRes, tccRes, enviaRes] = await Promise.allSettled([
+    trackInterrapidisimo(groups.interrapidisimo),
+    trackCoordinadora(groups.coordinadora),
+    trackTCC(groups.tcc),
+    trackEnvia(groups.envia),
+  ]);
 
-  // Merge results from all batches
-  const accepted = batchResults.flatMap(d => d?.data?.accepted || []);
-  const rejected = batchResults.flatMap(d => d?.data?.rejected || []);
-  const results = [];
-
-  for (const item of accepted) {
-    const num = item.number;
-    const trackInfo = item.track_info || {};
-    const status = trackInfo?.latest_status?.status || 'NotFound';
-    const lastEvent = trackInfo?.latest_event || {};
-    const description = lastEvent?.description || '';
-    const location = lastEvent?.location || '';
-    const city = location.split(',')[0]?.trim() || '';
-    const carrierName = item.track?.carrier_name || detectCarrier(num);
-
-    let days = null;
-    const tm = trackInfo?.time_metrics;
-    if (tm?.days_of_transit != null) {
-      days = tm.days_of_transit;
-    } else if (lastEvent?.time_iso) {
-      const evDate = new Date(lastEvent.time_iso);
-      if (!isNaN(evDate)) days = Math.floor((Date.now() - evDate) / 86400000);
-    }
-
-    const guide = allGuides.find(g => String(g.number).trim() === num) || {};
-    const phone = guide.phone || '';
-    const carrierUrl = getCarrierUrl(num, carrierName);
-    const { litperStatus, semaforo, priority, action } = getLitperStatus(status, days);
-    const template = getWhatsAppTemplate(litperStatus, carrierName);
-    const ticketText = getTicketText(litperStatus, num, carrierName, city, days);
-
-    results.push({ number: num, phone, carrier: carrierName, carrierUrl, status, litperStatus, semaforo, priority, action, city, days, description, template, ticketText });
-  }
-
-  for (const item of rejected) {
-    const guide = allGuides.find(g => String(g.number).trim() === item.number) || {};
-    const num = item.number;
-    const carrierName = detectCarrier(num);
-    results.push({
-      number: num, phone: guide.phone || '', carrier: carrierName,
-      carrierUrl: getCarrierUrl(num, carrierName), status: 'NotFound',
-      litperStatus: 'NO ENCONTRADA', semaforo: 'gray', priority: 99,
-      action: null, city: '', days: null,
-      description: 'Guía no encontrada en 17track', template: '', ticketText: ''
-    });
-  }
+  const results = [
+    ...getSettled(interRes, groups.interrapidisimo, 'Interrapidísimo'),
+    ...getSettled(coordRes, groups.coordinadora, 'Coordinadora'),
+    ...getSettled(tccRes, groups.tcc, 'TCC'),
+    ...getSettled(enviaRes, groups.envia, 'Envia'),
+    ...groups.unknown.map(g =>
+      buildResult(g, 'Desconocida', '', '', '', null,
+        'TRANSPORTADORA NO RECONOCIDA', 'gray', 100, null)
+    ),
+  ];
 
   results.sort((a, b) => a.priority - b.priority);
   return res.status(200).json({ guides: results });
 }
 
-function detectCarrier(num) {
-  const n = String(num).trim();
-  if (/^(014|0014|114|0114)/i.test(n)) return 'Interrapidísimo';
-  if (/^363/i.test(n)) return 'Coordinadora';
-  if (/^(615|616)/i.test(n)) return 'TCC';
-  if (/^envia/i.test(n)) return 'Envia';
-  return 'Auto';
+function getSettled(result, originals, carrierName) {
+  if (result.status === 'fulfilled') return result.value;
+  console.error(`[${carrierName}] settlement error:`, result.reason?.message);
+  return originals.map(g =>
+    buildResult(g, carrierName, getCarrierUrl(g.number, carrierName),
+      '', '', null, 'ERROR CONSULTA', 'gray', 98, null)
+  );
 }
 
-function getCarrierUrl(num, carrierName) {
-  const c = carrierName || detectCarrier(num);
-  if (c === 'Interrapidísimo' || /^(014|114)/i.test(num))
-    return `https://siguetuenvio.interrapidisimo.com/`;
-  if (c === 'Coordinadora' || /^363/i.test(num))
-    return `https://www.coordinadora.com/portafolio-de-servicios/servicios-en-linea/rastreo-de-envios/?guia=${num}`;
-  if (c === 'TCC' || /^(615|616)/i.test(num))
-    return `https://www.tcc.com.co/home`;
-  if (c === 'Envia')
-    return `https://www.envia.co/`;
-  return `https://t.17track.net/es#nums=${num}`;
+
+// ─── Interrapidísimo ──────────────────────────────────────────────────────────
+
+async function trackInterrapidisimo(guides) {
+  if (!guides.length) return [];
+  const CARRIER = 'Interrapidísimo';
+  const BASE = 'https://gateway.interrapidisimo.com/ConsultaGuiasSTE/api/v1/ResultadoConsulta/';
+  const BATCH = 5;
+
+  function norm12(n) {
+    const digits = n.replace(/\D/g, '');
+    return digits.length >= 12 ? digits.slice(-12) : digits.padStart(12, '0');
+  }
+
+  const results = [];
+
+  for (let i = 0; i < guides.length; i += BATCH) {
+    const batch = guides.slice(i, i + BATCH);
+    const nums = batch.map(g => norm12(g.number));
+    const valid = nums.filter(n => /^\d{12}$/.test(n));
+
+    if (!valid.length) {
+      batch.forEach(g =>
+        results.push(buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+          '', '', null, 'NO ENCONTRADA', 'gray', 99, null))
+      );
+      continue;
+    }
+
+    try {
+      const url = `${BASE}ConsultarGuias?NumerosGuias=${encodeURIComponent(valid.join(','))}&tokenRecaptcha=`;
+      const r = await fetch(url, {
+        headers: {
+          Accept: 'application/json, text/plain, */*',
+          Origin: 'https://siguetuenvio.interrapidisimo.com',
+          Referer: 'https://siguetuenvio.interrapidisimo.com/',
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        },
+      });
+
+      let raw = null;
+      try { raw = await r.json(); } catch (_) {}
+      console.log('[Inter]', r.status, JSON.stringify(raw)?.slice(0, 500));
+
+      const guiasMap = parseInterRaw(raw);
+
+      batch.forEach((g, idx) => {
+        const num12 = nums[idx];
+        const d = guiasMap[num12];
+        if (!d) {
+          results.push(buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+            '', '', null, 'NO ENCONTRADA', 'gray', 99, null));
+          return;
+        }
+        const days = daysSince(d.fecha);
+        const { litperStatus, semaforo, priority, action } = mapEstado(d.estado, days);
+        results.push(buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+          d.estado, d.ciudad, days, litperStatus, semaforo, priority, action));
+      });
+    } catch (err) {
+      console.error('[Inter] batch error:', err.message);
+      batch.forEach(g =>
+        results.push(buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+          '', '', null, 'ERROR CONSULTA', 'gray', 98, null))
+      );
+    }
+  }
+
+  return results;
 }
 
-function getLitperStatus(status, days) {
-  switch (status) {
+function parseInterRaw(raw) {
+  const map = {};
+  if (!raw) return map;
+
+  let arr = [];
+  if (Array.isArray(raw)) arr = raw;
+  else if (Array.isArray(raw.guias)) arr = raw.guias;
+  else if (Array.isArray(raw.resultado?.guias)) arr = raw.resultado.guias;
+  else if (Array.isArray(raw.data)) arr = raw.data;
+  else if (raw.numero || raw.NumeroGuia || raw.number) arr = [raw];
+
+  for (const g of arr) {
+    const num = String(g.numero || g.NumeroGuia || g.number || g.guia || '').trim();
+    if (!num) continue;
+    const key = num.replace(/\D/g, '').slice(-12).padStart(12, '0');
+    const rawEstado = g.estado || g.Estado || g.ultimoEstado || g.estadoActual || g.descripcion || '';
+    const estado = typeof rawEstado === 'object'
+      ? (rawEstado.descripcion || rawEstado.name || '')
+      : rawEstado;
+    const ciudad = g.ciudad || g.Ciudad || g.municipio || g.destino || g.ciudadDestino || '';
+    const eventos = g.eventos || g.Eventos || g.historial || g.history || [];
+    const lastEvt = Array.isArray(eventos) && eventos.length ? eventos[0] : null;
+    const fecha = g.fechaUltimoEvento || lastEvt?.fecha || lastEvt?.date || g.fecha || '';
+    map[key] = { estado, ciudad, fecha };
+  }
+  return map;
+}
+
+
+// ─── Coordinadora ─────────────────────────────────────────────────────────────
+
+async function trackCoordinadora(guides) {
+  if (!guides.length) return [];
+  const CARRIER = 'Coordinadora';
+
+  try {
+    const r = await fetch('https://apiv2.coordinadora.com/suite/cm-suite-middleware/guias', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-obv': 'pdzg4r5u089zltz',
+        Referer: 'https://rastreov2.coordinadora.com/',
+        Origin: 'https://rastreov2.coordinadora.com',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      },
+      body: JSON.stringify({ guias: guides.map(g => g.number) }),
+    });
+
+    let raw = null;
+    try { raw = await r.json(); } catch (_) {}
+    console.log('[Coordinadora]', r.status, JSON.stringify(raw)?.slice(0, 500));
+
+    const guiasMap = parseCoordRaw(raw);
+
+    return guides.map(g => {
+      const d = guiasMap[g.number];
+      if (!d) {
+        return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+          '', '', null, 'NO ENCONTRADA', 'gray', 99, null);
+      }
+      const days = daysSince(d.fecha);
+      const { litperStatus, semaforo, priority, action } = mapEstado(d.estado, days);
+      return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+        d.estado, d.ciudad, days, litperStatus, semaforo, priority, action);
+    });
+  } catch (err) {
+    console.error('[Coordinadora] error:', err.message);
+    return guides.map(g =>
+      buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+        '', '', null, 'ERROR CONSULTA', 'gray', 98, null)
+    );
+  }
+}
+
+function parseCoordRaw(raw) {
+  const map = {};
+  if (!raw) return map;
+
+  let arr = [];
+  if (Array.isArray(raw)) arr = raw;
+  else if (Array.isArray(raw.guias)) arr = raw.guias;
+  else if (Array.isArray(raw.data)) arr = raw.data;
+  else if (Array.isArray(raw.resultado)) arr = raw.resultado;
+  else if (Array.isArray(raw.results)) arr = raw.results;
+
+  for (const g of arr) {
+    const num = String(g.numero || g.guia || g.trackingNumber || g.number || '').trim();
+    if (!num) continue;
+    const rawEstado = g.estado || g.estadoActual || g.ultimoEstado || g.status || g.descripcionEstado || '';
+    const estado = typeof rawEstado === 'object'
+      ? (rawEstado.descripcion || rawEstado.name || '')
+      : rawEstado;
+    const ciudad = g.municipio || g.ciudad || g.ciudadDestino || g.destino || '';
+    const fecha = g.fechaUltimoEvento || g.fechaEstado || g.fecha || g.date || '';
+    map[num] = { estado, ciudad, fecha };
+  }
+  return map;
+}
+
+
+// ─── TCC ──────────────────────────────────────────────────────────────────────
+
+async function trackTCC(guides) {
+  if (!guides.length) return [];
+  const CARRIER = 'TCC';
+
+  return Promise.all(guides.map(async g => {
+    try {
+      const r = await fetch('https://tccrestify-dot-tcc-cloud.appspot.com/tracking/wid', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+        body: JSON.stringify({
+          remesas: { remesa: { numero: g.number, esrelacion: '' } },
+          captcha: '',
+          recaptchaVersion: 'v3',
+        }),
+      });
+
+      let raw = null;
+      try { raw = await r.json(); } catch (_) {}
+      console.log('[TCC]', r.status, JSON.stringify(raw)?.slice(0, 400));
+
+      if (!raw) {
+        return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+          '', '', null, 'NO ENCONTRADA', 'gray', 99, null);
+      }
+
+      const remesa = raw.remesas?.remesa || raw.remesa || raw;
+      const rawEstado = remesa?.estado?.descripcion
+        || remesa?.descripcionEstado
+        || remesa?.estadoActual?.descripcion
+        || remesa?.estado
+        || remesa?.ultimoEstado
+        || remesa?.status
+        || '';
+      const estado = typeof rawEstado === 'object'
+        ? (rawEstado.descripcion || rawEstado.name || '')
+        : rawEstado;
+      const ciudad = remesa?.ciudadDestino || remesa?.ciudad
+        || remesa?.municipioDestino || remesa?.destino || '';
+      const historial = remesa?.historial || remesa?.eventos || remesa?.history || [];
+      const fecha = remesa?.fechaUltimoEvento || remesa?.fechaEstado
+        || (Array.isArray(historial) && historial[0]?.fecha)
+        || remesa?.fecha || '';
+
+      if (!estado) {
+        return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+          '', '', null, 'NO ENCONTRADA', 'gray', 99, null);
+      }
+
+      const days = daysSince(fecha);
+      const { litperStatus, semaforo, priority, action } = mapEstado(estado, days);
+      return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+        estado, ciudad, days, litperStatus, semaforo, priority, action);
+    } catch (err) {
+      console.error('[TCC] error:', err.message);
+      return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+        '', '', null, 'ERROR CONSULTA', 'gray', 98, null);
+    }
+  }));
+}
+
+
+// ─── Envia ────────────────────────────────────────────────────────────────────
+
+async function trackEnvia(guides) {
+  if (!guides.length) return [];
+  const CARRIER = 'Envia';
+
+  try {
+    const r = await fetch('https://queries.envia.com/shipments/generaltrack?is_landing=true', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        Origin: 'https://envia.com',
+        Referer: 'https://envia.com/',
+      },
+      body: JSON.stringify({ trackingNumbers: guides.map(g => g.number) }),
+    });
+
+    let raw = null;
+    try { raw = await r.json(); } catch (_) {}
+    console.log('[Envia]', r.status, JSON.stringify(raw)?.slice(0, 500));
+
+    return guides.map(g => {
+      if (!raw) {
+        return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+          '', '', null, 'NO ENCONTRADA', 'gray', 99, null);
+      }
+
+      const arr = Array.isArray(raw)
+        ? raw
+        : (raw.shipments || raw.data || raw.result || raw.tracking || []);
+
+      const item = arr.find(s =>
+        s.trackingNumber === g.number || s.numero === g.number
+        || s.guia === g.number || s.number === g.number
+        || s.tracking_number === g.number
+      );
+
+      if (!item) {
+        return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+          '', '', null, 'NO ENCONTRADA', 'gray', 99, null);
+      }
+
+      const rawEstado = item.status || item.estado || item.lastStatus || item.ultimoEstado || '';
+      const estado = typeof rawEstado === 'object'
+        ? (rawEstado.description || rawEstado.descripcion || rawEstado.name || '')
+        : rawEstado;
+      const ciudad = item.city || item.ciudad || item.destCity
+        || item.destinationCity || item.destino || '';
+      const fecha = item.lastUpdate || item.fechaUltimoEvento
+        || item.updatedAt || item.updated_at || item.date || '';
+      const description = item.lastEvent || item.ultimoEvento
+        || item.lastEventDescription || estado;
+
+      const days = daysSince(fecha);
+      const { litperStatus, semaforo, priority, action } = mapEstado(estado, days);
+      return buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+        description, ciudad, days, litperStatus, semaforo, priority, action);
+    });
+  } catch (err) {
+    console.error('[Envia] error:', err.message);
+    return guides.map(g =>
+      buildResult(g, CARRIER, getCarrierUrl(g.number, CARRIER),
+        '', '', null, 'ERROR CONSULTA', 'gray', 98, null)
+    );
+  }
+}
+
+
+// ─── Universal status mapper ──────────────────────────────────────────────────
+
+function mapEstado(estado, days) {
+  // Strip accents + uppercase for robust regex across all carriers
+  const e = String(estado || '')
+    .toUpperCase()
+    .normalize('NFD')
+    .replace(/[̀-ͯ]/g, '');
+
+  if (/ENTREGAD|DELIVERED/.test(e)) return statusData('Delivered', days);
+  if (/EN\s*(RUTA|REPARTO|DOMICILIO)|OUT.*DELIVERY|PARA.*ENTREGA|ULTIMO.*PASO/.test(e))
+    return statusData('InTransitClose', days);
+  if (/DEVOLU|RETORNO|RETORNAD|RETURN/.test(e)) return statusData('Returned', days);
+  if (/NO.*POSIBLE|INTENTO.*FALLIDO|FAIL.*DELIVER|NOVEDAD.*ENTREGA/.test(e))
+    return statusData('Undelivered', days);
+  if (/OFICINA|PENDIENTE.*RECOG|RECOG.*CLIENTE|PICKUP/.test(e))
+    return statusData('PickUp', days);
+  if (/NOVEDAD|ALERTA|INCIDENCIA(?!.*ENTREGA)|ALERT/.test(e))
+    return statusData('Alert', days);
+  if (/VENCID|EXPIRED|CADUCD/.test(e)) return statusData('Expired', days);
+  if (/TRANSITO|BODEGA|CLASIF|CAMINO|IN.*TRANSIT|PROCESAND|RECOLECT|RECIBID/.test(e))
+    return statusData('InTransit', days);
+
+  // Catch-all: treat unknown statuses as in transit (non-zero status = something is happening)
+  return statusData('InTransit', days);
+}
+
+function statusData(key, days) {
+  switch (key) {
     case 'Delivered':
       return { litperStatus: 'ENTREGADO', semaforo: 'green', priority: 50, action: null };
+    case 'InTransitClose':
+      return { litperStatus: 'EN REPARTO', semaforo: 'green', priority: 20, action: 'notify_reparto' };
     case 'InTransit':
-      if (!days || days <= 2)
-        return { litperStatus: 'EN REPARTO', semaforo: 'green', priority: 20, action: 'notify_reparto' };
-      if (days <= 5)
-        return { litperStatus: 'EN TRÁNSITO', semaforo: 'yellow', priority: 30, action: 'notify_transito' };
-      return { litperStatus: 'DEMORADO', semaforo: 'red', priority: 5, action: 'notify_demorado' };
+      return (!days || days <= 5)
+        ? { litperStatus: 'EN TRÁNSITO', semaforo: 'yellow', priority: 30, action: 'notify_transito' }
+        : { litperStatus: 'DEMORADO', semaforo: 'red', priority: 5, action: 'notify_demorado' };
     case 'PickUp':
-      if (!days || days < 3)
-        return { litperStatus: 'RECLAMO EN OFICINA', semaforo: 'yellow', priority: 15, action: 'notify_oficina' };
-      return { litperStatus: 'RECLAMO URGENTE (+3d)', semaforo: 'red', priority: 3, action: 'notify_oficina_urgente' };
+      return (!days || days < 3)
+        ? { litperStatus: 'RECLAMO EN OFICINA', semaforo: 'yellow', priority: 15, action: 'notify_oficina' }
+        : { litperStatus: 'RECLAMO URGENTE (+3d)', semaforo: 'red', priority: 3, action: 'notify_oficina_urgente' };
     case 'Returned':
       return { litperStatus: 'DEVOLUCIÓN', semaforo: 'red', priority: 1, action: 'notify_devolucion' };
     case 'Undelivered':
@@ -145,31 +412,77 @@ function getLitperStatus(status, days) {
       return { litperStatus: 'NOVEDAD', semaforo: 'red', priority: 4, action: 'notify_novedad' };
     case 'Expired':
       return { litperStatus: 'GUÍA VENCIDA', semaforo: 'red', priority: 6, action: 'notify_vencida' };
-    case 'InfoReceived':
-      return { litperStatus: 'REGISTRADA', semaforo: 'gray', priority: 60, action: null };
     default:
       return { litperStatus: 'NO ENCONTRADA', semaforo: 'gray', priority: 99, action: null };
   }
 }
 
-function getWhatsAppTemplate(litperStatus, carrier) {
-  const c = carrier || 'la transportadora';
-  const templates = {
-    'EN REPARTO': `Hola! 👋 Te informamos que tu pedido *Litper* está en camino y el mensajero lo entregará hoy. Por favor mantén tu celular disponible y asegúrate de estar en casa. Cualquier novedad estamos para ayudarte 😊`,
-    'EN TRÁNSITO': `Hola! 😊 Tu pedido *Litper* está en camino. En estos momentos se encuentra en tránsito con *${c}*. Te avisamos en cuanto tenga novedades de entrega 📦`,
-    'DEMORADO': `Hola! 😊 Tu pedido *Litper* está tardando un poco más de lo esperado con *${c}*. Estamos haciendo seguimiento activo y te avisaremos tan pronto tengamos novedades. ¡Gracias por tu paciencia! 🙏`,
-    'RECLAMO EN OFICINA': `Hola! 👋 Tu pedido *Litper* está disponible para recoger en la oficina de *${c}*. Te recomendamos recogerlo pronto para evitar devolución. ¿Necesitas la dirección de la oficina? 😊`,
-    'RECLAMO URGENTE (+3d)': `Hola! 😊 Tu pedido *Litper* lleva varios días esperando en la oficina de *${c}*. Si no lo recogen pronto será devuelto automáticamente. ¿Podemos ayudarte a coordinar algo? 📦`,
-    'NO FUE POSIBLE ENTREGAR': `Hola! 😊 Intentamos entregarte tu pedido *Litper* pero no fue posible. Queremos coordinar una nueva entrega contigo. ¿Cuándo estás disponible para recibirlo? 📦`,
-    'DEVOLUCIÓN': `Hola! 😊 Tu pedido *Litper* está siendo devuelto. Queremos solucionarlo para ti — ¿podemos coordinar un reenvío? ¡Te ayudamos! 🙌`,
-    'NOVEDAD': `Hola! 😊 Tu pedido *Litper* presenta una novedad con *${c}*. Nuestro equipo la está gestionando. ¿Puedes confirmarnos si estás disponible para recibirlo? 📦`,
-    'GUÍA VENCIDA': `Hola! 😊 La guía de tu pedido *Litper* ha vencido en el sistema. Necesitamos coordinar contigo para el reenvío. ¿Cuándo podemos intentar de nuevo? 📦`,
-  };
-  return templates[litperStatus] || '';
+
+// ─── Shared utilities ─────────────────────────────────────────────────────────
+
+function detectCarrierKey(num) {
+  if (/^(014|0014|114|0114)/.test(num)) return 'interrapidisimo';
+  if (/^363/.test(num)) return 'coordinadora';
+  if (/^(615|616)/.test(num)) return 'tcc';
+  if (/^034/.test(num)) return 'envia';
+  return 'unknown';
 }
 
-function getTicketText(litperStatus, guideNum, carrier, city, days) {
+function getCarrierUrl(num, carrier) {
+  if (carrier === 'Interrapidísimo') return 'https://siguetuenvio.interrapidisimo.com/';
+  if (carrier === 'Coordinadora')
+    return `https://www.coordinadora.com/portafolio-de-servicios/servicios-en-linea/rastreo-de-envios/?guia=${num}`;
+  if (carrier === 'TCC') return 'https://www.tcc.com.co/home';
+  if (carrier === 'Envia') return 'https://www.envia.co/';
+  return '';
+}
+
+function daysSince(dateStr) {
+  if (!dateStr) return null;
+  try {
+    const d = new Date(dateStr);
+    if (isNaN(d.getTime())) return null;
+    return Math.floor((Date.now() - d.getTime()) / 86400000);
+  } catch { return null; }
+}
+
+function buildResult(guide, carrier, carrierUrl, description, city, days, ls, semaforo, priority, action) {
+  return {
+    number: guide.number,
+    phone: guide.phone || '',
+    carrier,
+    carrierUrl,
+    status: description || '',
+    litperStatus: ls,
+    semaforo,
+    priority,
+    action,
+    city: city || '',
+    days,
+    description: description || '',
+    template: getWhatsAppTemplate(ls, carrier),
+    ticketText: getTicketText(ls, guide.number, carrier, city, days),
+  };
+}
+
+function getWhatsAppTemplate(ls, carrier) {
+  const c = carrier || 'la transportadora';
+  const t = {
+    'EN REPARTO': `Hola! 👋 Tu pedido *Litper* está en camino y lo entregarán hoy. Por favor mantén tu celular disponible y asegúrate de estar en casa 😊`,
+    'EN TRÁNSITO': `Hola! 😊 Tu pedido *Litper* va en camino con *${c}*. Te avisamos cuando tenga novedades de entrega 📦`,
+    'DEMORADO': `Hola! 😊 Tu pedido *Litper* está tardando más de lo esperado con *${c}*. Hacemos seguimiento activo. ¡Gracias por tu paciencia! 🙏`,
+    'RECLAMO EN OFICINA': `Hola! 👋 Tu pedido *Litper* está disponible en la oficina de *${c}*. Te recomendamos recogerlo pronto. ¿Necesitas la dirección? 😊`,
+    'RECLAMO URGENTE (+3d)': `Hola! 😊 Tu pedido *Litper* lleva varios días en la oficina de *${c}*. Si no lo recogen pronto será devuelto. ¿Podemos ayudarte? 📦`,
+    'NO FUE POSIBLE ENTREGAR': `Hola! 😊 Intentamos entregarte tu pedido *Litper* pero no fue posible. ¿Cuándo estás disponible? Coordinamos nueva entrega 📦`,
+    'DEVOLUCIÓN': `Hola! 😊 Tu pedido *Litper* está siendo devuelto. Queremos solucionarlo — ¿coordinamos un reenvío? 🙌`,
+    'NOVEDAD': `Hola! 😊 Tu pedido *Litper* presenta una novedad con *${c}*. Lo estamos gestionando. ¿Confirmas disponibilidad? 📦`,
+    'GUÍA VENCIDA': `Hola! 😊 La guía de tu pedido *Litper* ha vencido. Necesitamos coordinar un reenvío. ¿Cuándo podemos intentar? 📦`,
+  };
+  return t[ls] || '';
+}
+
+function getTicketText(ls, num, carrier, city, days) {
   const urgent = ['DEVOLUCIÓN', 'NO FUE POSIBLE ENTREGAR', 'RECLAMO URGENTE (+3d)', 'NOVEDAD', 'GUÍA VENCIDA'];
-  if (!urgent.includes(litperStatus)) return '';
-  return `Seguimiento ${carrier} | Guía: ${guideNum} | Estado: ${litperStatus} | Ciudad: ${city || 'N/A'} | Días: ${days ?? 'N/A'} | Acción requerida: gestión prioritaria`;
+  if (!urgent.includes(ls)) return '';
+  return `Seguimiento ${carrier} | Guía: ${num} | Estado: ${ls} | Ciudad: ${city || 'N/A'} | Días: ${days ?? 'N/A'} | Acción requerida: gestión prioritaria`;
 }
