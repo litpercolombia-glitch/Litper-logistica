@@ -1,13 +1,19 @@
 // Litper Guides — Tracking API
 // Carrier detection by guide prefix:
-//   014.../0014.../114.../0114... → Interrapidísimo  (EnvioClick idCarrier: 28)
-//   363...                        → Coordinadora      (EnvioClick idCarrier: 14)
-//   615.../616...                 → TCC               (EnvioClick idCarrier: 44)
-//   034...                        → Envía             (EnvioClick idCarrier: 28)
-//   240...                        → Servientrega      (portal SeguridadRastreoWeb)
+//   014160.../014161.../114... → Envía               (EnvioClick idCarrier: 28)
+//   014162.../0014.../0114...  → Interrapidísimo     (EnvioClick idCarrier: 28)
+//   363...                     → Coordinadora         (EnvioClick idCarrier: 14)
+//   615.../616...              → TCC                  (EnvioClick idCarrier: 44)
+//   034...                     → Envía (otra serie)   (EnvioClick idCarrier: 28)
+//   240...                     → Servientrega         (portal SeguridadRastreoWeb)
 //
-// NOTE: Inter and Envía share the same EnvioClick carrier id (28). EnvioClick
-// retains data 30+ days vs Inter's own API which purges in <7 days.
+// NOTA: Envía y Inter comparten EnvioClick id:28 — datos idénticos, solo difiere
+// el nombre mostrado y la URL de rastreo.
+// Distinción Envía vs Inter por sub-prefijo numérico:
+//   014160.../014161... → Envía
+//   014162...           → Interrapidísimo
+//   114...              → Envía
+//   0014.../0114...     → Interrapidísimo (prefijo largo)
 //
 // EnvioClick response shape:
 //   { data: { events: { "GUIDE_NUM": [{eventDateTime, eventDescription, eventPlace},...] } } }
@@ -47,11 +53,34 @@ const CARRIER_CONFIG = {
 
 function detectCarrier(num) {
   const n = num.replace(/\s/g, '');
-  if (/^(014|0014|114|0114)/.test(n)) return 'interrapidisimo';
-  if (/^363/.test(n))                 return 'coordinadora';
-  if (/^(615|616)/.test(n))           return 'tcc';
-  if (/^034/.test(n))                 return 'envia';
-  if (/^240/.test(n))                 return 'servientrega';
+
+  // Servientrega: 240xxx
+  if (/^240/.test(n)) return 'servientrega';
+
+  // TCC: 615xxx / 616xxx
+  if (/^(615|616)/.test(n)) return 'tcc';
+
+  // Coordinadora: 363xxx
+  if (/^363/.test(n)) return 'coordinadora';
+
+  // Envía serie corta: 034xxx
+  if (/^034/.test(n)) return 'envia';
+
+  // Envía: 114xxx (sin cero inicial)
+  if (/^114/.test(n)) return 'envia';
+
+  // Distinguir Envía vs Inter por sub-prefijo en serie 014:
+  //   014160.../014161... → Envía
+  //   014162...           → Interrapidísimo
+  if (/^0141(60|61)/.test(n)) return 'envia';
+  if (/^01416[2-9]/.test(n)) return 'interrapidisimo';
+
+  // Prefijos largos con cero extra: 0014, 0114
+  if (/^(0014|0114)/.test(n)) return 'interrapidisimo';
+
+  // Cualquier otra variante 014xxx que no matcheó arriba → Inter por defecto
+  if (/^014/.test(n)) return 'interrapidisimo';
+
   return 'unknown';
 }
 
@@ -132,25 +161,40 @@ function normalizeStatus(description) {
   if (!description) return { litperStatus: 'DESCONOCIDO', semaforo: 'gray', priority: 50 };
   const d = description.toLowerCase().trim();
 
+  // ── ENTREGADO (verde) ────────────────────────────────────────────────────
   if (d.includes('entregad') || d.includes('entrega exitosa') ||
-      d.includes('envio entregado') || d.includes('envio entregado') || d === 'delivered') {
+      d.includes('envio entregado') || d === 'delivered') {
     return { litperStatus: 'ENTREGADO', semaforo: 'green', priority: 1 };
   }
-  if (d.includes('no se entrega') || d.includes('no entregad') || d.includes('devuelt') ||
-      d.includes('devolver') || d.includes('cancelad') || d.includes('perdid') ||
-      d.includes('rechazad') || d.includes('no encontrad') || d.includes('direccion incorrecta') ||
-      d.includes('cliente no encontrad') || d.includes('ausente') || d.includes('novedad')) {
+
+  // ── NOVEDAD (rojo) — fallo de entrega, requiere acción ──────────────────
+  if (d.includes('devuelt') || d.includes('devolver') ||
+      d.includes('no se entrega') || d.includes('no entregad') ||
+      d.includes('cancelad') || d.includes('perdid') ||
+      d.includes('rechazad') || d.includes('no encontrad') ||
+      d.includes('direccion incorrecta') || d.includes('dirección incorrecta') ||
+      d.includes('cliente no encontrad') || d.includes('ausente') ||
+      d.includes('rehusa') || d.includes('rehúsa') ||
+      d.includes('se niega') || d.includes('novedad') ||
+      d.includes('devolucion') || d.includes('devolución')) {
     return { litperStatus: 'NOVEDAD', semaforo: 'red', priority: 10 };
   }
+
+  // ── EN RUTA (amarillo) ───────────────────────────────────────────────────
   if (d.includes('reparto') || d.includes('en transporte') || d.includes('en terminal') ||
       d.includes('en bodega') || d.includes('recogid') || d.includes('en proceso') ||
-      d.includes('en recoleccion') || d.includes('en ruta') || d.includes('salida a ruta') ||
-      d.includes('en camino') || d.includes('en distribucion') || d.includes('recibid') ||
-      d.includes('clasificad') || d.includes('en destino') || d.includes('en planta') ||
-      d.includes('en centro') || d.includes('admitid') || d.includes('ingresad') ||
-      d.includes('programado') || d.includes('captura') || d.includes('recoleccion')) {
+      d.includes('en recoleccion') || d.includes('en recolección') ||
+      d.includes('en ruta') || d.includes('salida a ruta') ||
+      d.includes('en camino') || d.includes('en distribucion') || d.includes('en distribución') ||
+      d.includes('recibid') || d.includes('clasificad') || d.includes('en destino') ||
+      d.includes('en planta') || d.includes('en centro') ||
+      d.includes('admitid') || d.includes('ingresad') ||
+      d.includes('programado') || d.includes('captura') || d.includes('recoleccion') ||
+      d.includes('en camino') || d.includes('fecha de captura') || d.includes('fecha de recoleccion')) {
     return { litperStatus: 'EN RUTA', semaforo: 'yellow', priority: 20 };
   }
+
+  // Fallback: mostrar descripción tal cual, amarillo
   return { litperStatus: d.toUpperCase().substring(0, 40), semaforo: 'yellow', priority: 25 };
 }
 
