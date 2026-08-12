@@ -3,11 +3,15 @@
 //   014.../0014.../114.../0114... → Interrapidísimo  (API propia)
 //   363...                        → Coordinadora      (EnvioClick idCarrier: 14)
 //   615.../616...                 → TCC               (EnvioClick idCarrier: 44)
-//   034...                        → Envia             (EnvioClick idCarrier: 28)
+//   034...                        → Envía             (EnvioClick idCarrier: 28)
+//   240...                        → Servientrega      (portal SeguridadRastreoWeb)
 
 const ENVIOCLICK_TOKEN = process.env.ENVIOCLICK_TOKEN || 'ce156067-9edc-4cf2-80d1-5b5497d6e625';
 const ENVIOCLICK_URL   = 'https://landing.envioclickpro.com/carriers/tracking-batch';
 const INTER_API_URL    = 'https://www.interrapidisimo.com/api/search_guia';
+const SVTE_BASE        = 'https://www.servientrega.com';
+const SVTE_REGISTER    = `${SVTE_BASE}/SeguridadRastreoWeb/RegistroRastreo`;
+const SVTE_READ        = `${SVTE_BASE}/SeguridadRastreoWeb/LecturaRastreo`;
 
 const CARRIER_CONFIG = {
   interrapidisimo: {
@@ -29,6 +33,10 @@ const CARRIER_CONFIG = {
     name: 'Envía',
     url:  n => `https://www.envia.co/rastreo?numero=${n}`,
   },
+  servientrega: {
+    name: 'Servientrega',
+    url:  n => `${SVTE_BASE}/wps/portal/rastreo-envio/detalle?id=${n}&tipo=0`,
+  },
 };
 
 // ─── Carrier detection ────────────────────────────────────────────────────────
@@ -38,12 +46,11 @@ function detectCarrier(num) {
   if (/^363/.test(n))                 return 'coordinadora';
   if (/^(615|616)/.test(n))           return 'tcc';
   if (/^034/.test(n))                 return 'envia';
+  if (/^240/.test(n))                 return 'servientrega';
   return 'unknown';
 }
 
 // ─── Interrapidísimo direct API ───────────────────────────────────────────────
-// POST https://www.interrapidisimo.com/api/search_guia
-// Body: { "NumerosGuias": "014XXX,014YYY" }
 async function queryInterrapidisimo(trackingCodes) {
   const body = { NumerosGuias: trackingCodes.join(',') };
   const res = await fetch(INTER_API_URL, {
@@ -59,7 +66,6 @@ async function queryInterrapidisimo(trackingCodes) {
     signal: AbortSignal.timeout(20000),
   });
 
-  // 404 or error body → guide not found (not a transport error)
   if (res.status === 404) {
     const j = await res.json().catch(() => ({}));
     return { notFound: true, message: j.error || 'Guía no encontrada' };
@@ -72,15 +78,9 @@ async function queryInterrapidisimo(trackingCodes) {
   return { notFound: false, data };
 }
 
-// Parse Inter's success response into a normalized events array.
-// The exact format is unknown for confirmed deliveries; we handle defensively.
-// Known patterns from Next.js carrier APIs:
-//   - Array of objects with { estado, fecha, ciudad, descripcion }
-//   - Single object with a "guias" or "eventos" key
 function parseInterEvents(data, guideNum) {
   if (!data) return null;
 
-  // If it's an array directly
   if (Array.isArray(data)) {
     return data.map(e => ({
       eventDescription: e.estado || e.descripcion || e.description || e.eventDescription || String(e),
@@ -89,18 +89,15 @@ function parseInterEvents(data, guideNum) {
     }));
   }
 
-  // If it's an object keyed by guide number
   if (data[guideNum] && Array.isArray(data[guideNum])) {
     return parseInterEvents(data[guideNum], guideNum);
   }
 
-  // If it has a guias / eventos / events array
   const arr = data.guias || data.eventos || data.events || data.tracking || data.resultado;
   if (Array.isArray(arr)) {
     return parseInterEvents(arr, guideNum);
   }
 
-  // Single object — treat as a single event
   if (typeof data === 'object' && Object.keys(data).length > 0) {
     return [{
       eventDescription: data.estado || data.descripcion || data.description || 'Guía localizada',
@@ -110,6 +107,96 @@ function parseInterEvents(data, guideNum) {
   }
 
   return null;
+}
+
+// ─── Servientrega two-step cookie API ────────────────────────────────────────
+// Step 1: GET RegistroRastreo with tracknumber/tracktype headers → get JSESSIONID
+// Step 2: GET LecturaRastreo with that cookie → returns XML tracking data
+async function queryServientrega(guideNum) {
+  // Step 1: register guide in server session
+  const regRes = await fetch(SVTE_REGISTER, {
+    method: 'GET',
+    headers: {
+      'tracknumber': guideNum,
+      'tracktype':   '0',
+      'captcha':     'false',
+      'user-agent':  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'referer':     `${SVTE_BASE}/wps/portal/rastreo-envio/detalle?id=${guideNum}&tipo=0`,
+      'accept':      'application/xml, text/xml, */*',
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!regRes.ok) {
+    throw new Error(`Servientrega RegistroRastreo HTTP ${regRes.status}`);
+  }
+
+  // Extract JSESSIONID from Set-Cookie header
+  const setCookie = regRes.headers.get('set-cookie') || '';
+  const cookieMatch = setCookie.match(/JSESSIONID=([^;,\s]+)/i);
+  if (!cookieMatch) {
+    throw new Error('Servientrega: no JSESSIONID en respuesta');
+  }
+  const jsessionId = cookieMatch[1];
+
+  // Step 2: read tracking XML
+  const readRes = await fetch(SVTE_READ, {
+    method: 'GET',
+    headers: {
+      'cookie':     `JSESSIONID=${jsessionId}`,
+      'user-agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'referer':    `${SVTE_BASE}/wps/portal/rastreo-envio/detalle?id=${guideNum}&tipo=0`,
+      'accept':     'application/xml, text/xml, */*',
+    },
+    signal: AbortSignal.timeout(15000),
+  });
+
+  if (!readRes.ok) {
+    throw new Error(`Servientrega LecturaRastreo HTTP ${readRes.status}`);
+  }
+
+  return readRes.text();
+}
+
+// Parse Servientrega XML into normalized events array
+// Active guide XML expected to contain <evento> elements with fecha, hora, estado, ciudad etc.
+// Expired/not-found guide returns only: <trackType>0</trackType><trackNumber>...</trackNumber><captcha>false</captcha>
+function parseServientregaXml(xml) {
+  if (!xml || typeof xml !== 'string') return null;
+
+  // Detect "not found" — XML has no <evento> or <eventos> tags
+  if (!/<evento[\s>]/i.test(xml)) {
+    return null; // no events
+  }
+
+  const events = [];
+  const eventoRegex = /<evento[^>]*>([\s\S]*?)<\/evento>/gi;
+  let match;
+
+  while ((match = eventoRegex.exec(xml)) !== null) {
+    const block = match[1];
+
+    // Helper: extract text content of a tag (case-insensitive, handles attributes)
+    const getTag = (tag) => {
+      const m = block.match(new RegExp(`<${tag}[^>]*>([^<]*)<\\/${tag}>`, 'i'));
+      return m ? m[1].trim() : '';
+    };
+
+    const fecha  = getTag('fecha') || getTag('date') || getTag('fechaEvento');
+    const hora   = getTag('hora')  || getTag('hour') || getTag('horaEvento') || getTag('time');
+    const estado = getTag('estado') || getTag('descripcion') || getTag('description') || getTag('evento') || getTag('nombre');
+    const ciudad = getTag('ciudad') || getTag('city')        || getTag('oficina')     || getTag('sede')   || getTag('sucursal');
+
+    if (!estado) continue; // skip empty events
+
+    events.push({
+      eventDescription: estado,
+      eventPlace:       ciudad,
+      eventDateTime:    fecha ? `${fecha}${hora ? ' ' + hora : ''}` : '',
+    });
+  }
+
+  return events.length > 0 ? events : null;
 }
 
 // ─── EnvioClick batch query ───────────────────────────────────────────────────
@@ -253,7 +340,6 @@ async function processInter(guideNums, phoneMap) {
     const resp = await queryInterrapidisimo(guideNums);
 
     if (resp.notFound) {
-      // API returned 404 for the entire batch (all guides unknown)
       for (const num of guideNums) {
         results.push({
           number:       num,
@@ -273,22 +359,19 @@ async function processInter(guideNums, phoneMap) {
       return results;
     }
 
-    // Try to parse per-guide results from the response
     for (const num of guideNums) {
-      // Inter may return a per-guide keyed object or a flat array
       let eventsRaw = null;
 
       if (resp.data) {
         if (resp.data[num]) {
           eventsRaw = parseInterEvents(resp.data[num], num);
         } else if (Array.isArray(resp.data)) {
-          // Filter events for this guide (if data is a flat array)
           const filtered = resp.data.filter(e =>
             (e.guia || e.guide || e.numero || '') === num
           );
           eventsRaw = filtered.length > 0
             ? parseInterEvents(filtered, num)
-            : parseInterEvents(resp.data, num); // use all if can't filter
+            : parseInterEvents(resp.data, num);
         } else {
           eventsRaw = parseInterEvents(resp.data, num);
         }
@@ -297,7 +380,6 @@ async function processInter(guideNums, phoneMap) {
       results.push(buildResult(num, phoneMap[num] || '', 'interrapidisimo', eventsRaw, false));
     }
   } catch (err) {
-    // Transport/network error — mark all guides as error
     for (const num of guideNums) {
       results.push({
         number:       num,
@@ -316,6 +398,55 @@ async function processInter(guideNums, phoneMap) {
     }
   }
   return results;
+}
+
+// ─── Process Servientrega guides ──────────────────────────────────────────────
+// Each guide requires its own session (separate cookie per lookup), so we
+// run them concurrently with individual requests.
+async function processServientrega(guideNums, phoneMap) {
+  const promises = guideNums.map(async (num) => {
+    try {
+      const xml = await queryServientrega(num);
+      const events = parseServientregaXml(xml);
+
+      if (!events) {
+        // Minimal XML returned → guide expired or not found
+        return {
+          number:       num,
+          phone:        phoneMap[num] || '',
+          carrier:      CARRIER_CONFIG.servientrega.name,
+          carrierUrl:   CARRIER_CONFIG.servientrega.url(num),
+          litperStatus: 'NO ENCONTRADA',
+          semaforo:     'gray',
+          priority:     80,
+          description:  'Guía no encontrada o sin eventos',
+          city:         '',
+          days:         null,
+          template:     null,
+          ticketText:   null,
+        };
+      }
+
+      return buildResult(num, phoneMap[num] || '', 'servientrega', events, false);
+    } catch (err) {
+      return {
+        number:       num,
+        phone:        phoneMap[num] || '',
+        carrier:      CARRIER_CONFIG.servientrega.name,
+        carrierUrl:   CARRIER_CONFIG.servientrega.url(num),
+        litperStatus: 'ERROR API',
+        semaforo:     'gray',
+        priority:     95,
+        description:  err.message || 'Error consultando Servientrega',
+        city:         '',
+        days:         null,
+        template:     null,
+        ticketText:   null,
+      };
+    }
+  });
+
+  return Promise.all(promises);
 }
 
 // ─── Process EnvioClick carriers ─────────────────────────────────────────────
@@ -366,7 +497,7 @@ export default async function handler(req, res) {
   }
 
   // Preserve phone per guide number
-  const phoneMap  = {};
+  const phoneMap   = {};
   const normalized = [];
   for (const g of guides.slice(0, 500)) {
     const num = String(g.number || g).trim();
@@ -385,6 +516,7 @@ export default async function handler(req, res) {
     coordinadora:    [],
     tcc:             [],
     envia:           [],
+    servientrega:    [],
     unknown:         [],
   };
   for (const num of normalized) {
@@ -402,6 +534,9 @@ export default async function handler(req, res) {
       promises.push(processEnvioClick(key, groups[key], phoneMap));
     }
   }
+  if (groups.servientrega.length > 0) {
+    promises.push(processServientrega(groups.servientrega, phoneMap));
+  }
 
   const settled = await Promise.all(promises);
   const results = settled.flat();
@@ -416,7 +551,7 @@ export default async function handler(req, res) {
       litperStatus: 'TRANSPORTADORA NO RECONOCIDA',
       semaforo:     'gray',
       priority:     100,
-      description:  'Prefijo de guía no reconocido (usar 014/363/615/034)',
+      description:  'Prefijo no reconocido. Soportados: 014/363/615/034/240',
       city:         '',
       days:         null,
       template:     null,
